@@ -25,7 +25,20 @@ pub fn start_eviction_thread(
         .spawn(move || {
             debug!("Eviction thread started, eviction_minutes={}", eviction_minutes);
             while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(check_interval);
+                // Sleep in 1-second ticks so we notice the shutdown flag promptly.
+                // A single sleep(check_interval) blocked shutdown for up to 60s,
+                // causing the ctrl-C hang bug — eviction_handle.join() in main
+                // would wait the full interval before the thread could exit.
+                let mut remaining = check_interval;
+                let tick = Duration::from_secs(1);
+                while remaining > Duration::ZERO {
+                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let sleep_time = remaining.min(tick);
+                    std::thread::sleep(sleep_time);
+                    remaining = remaining.saturating_sub(sleep_time);
+                }
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
