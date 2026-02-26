@@ -1,16 +1,16 @@
-# CAS-FS: Compare-and-Swap Filesystem
+# dibs: Compare-and-Swap Filesystem
 
 ## Specification v1.0
 
 ### Purpose
 
-CAS-FS is a FUSE filesystem that enforces optimistic concurrency control over a backing directory. It is designed for environments where multiple AI coding agents operate concurrently on the same project. The filesystem ensures that no agent can silently overwrite another agent's changes by requiring every write to present a valid content hash obtained from a prior read.
+dibs is a FUSE filesystem that enforces optimistic concurrency control over a backing directory. It is designed for environments where multiple AI coding agents operate concurrently on the same project. The filesystem ensures that no agent can silently overwrite another agent's changes by requiring every write to present a valid content hash obtained from a prior read.
 
 ---
 
 ### Core Concepts
 
-**Backing directory**: The real directory on disk containing the project files. CAS-FS does not modify the structure or format of files in the backing directory. Files stored there are always plain files, readable by any tool.
+**Backing directory**: The real directory on disk containing the project files. dibs does not modify the structure or format of files in the backing directory. Files stored there are always plain files, readable by any tool.
 
 **Mount point**: The FUSE-mounted directory through which agents access files. All agent file access MUST go through the mount point. The backing directory should be permission-restricted so agents cannot write to it directly.
 
@@ -23,11 +23,11 @@ CAS-FS is a FUSE filesystem that enforces optimistic concurrency control over a 
 ### Architecture
 
 ```
-Agent A ──► /mnt/project (FUSE mount) ──► CAS-FS daemon ──► /home/user/project (backing dir)
+Agent A ──► /mnt/project (FUSE mount) ──► dibs daemon ──► /home/user/project (backing dir)
 Agent B ──► /mnt/project (FUSE mount) ──┘
 ```
 
-A single CAS-FS daemon serves all agents through one mount point. Concurrency control happens inside the daemon. The daemon maintains an in-memory hash table mapping file paths to their last-known content hashes.
+A single dibs daemon serves all agents through one mount point. Concurrency control happens inside the daemon. The daemon maintains an in-memory hash table mapping file paths to their last-known content hashes.
 
 ---
 
@@ -168,7 +168,7 @@ The FUSE filesystem accepts the following mount options:
 
 ### Operational Notes
 
-**Permissions enforcement**: The backing directory should be owned by a dedicated user (e.g., `casfs`) and not writable by the agents' user. The FUSE daemon runs as `casfs` (or root) and proxies all operations. Agents access files through the mount point under FUSE's permission model. This prevents agents from bypassing CAS-FS by writing directly to the backing directory.
+**Permissions enforcement**: The backing directory should be owned by a dedicated user (e.g., `casfs`) and not writable by the agents' user. The FUSE daemon runs as `casfs` (or root) and proxies all operations. Agents access files through the mount point under FUSE's permission model. This prevents agents from bypassing dibs by writing directly to the backing directory.
 
 **Performance**: The CAS check on write requires reading the current backing file content and computing SHA-256. For large files, this adds latency. Acceptable tradeoffs:
 - Files under 10 MB: always perform full CAS check.
@@ -206,7 +206,7 @@ The FUSE filesystem accepts the following mount options:
 ### Out of Scope
 
 The following are explicitly NOT part of this specification:
-- Conflict resolution or merging. CAS-FS only detects conflicts and rejects the losing write. The agent or user decides what to do.
-- Network or distributed operation. CAS-FS operates on a single machine.
-- Versioning or history. CAS-FS does not store prior versions (use git for that).
+- Conflict resolution or merging. dibs only detects conflicts and rejects the losing write. The agent or user decides what to do.
+- Network or distributed operation. dibs operates on a single machine.
+- Versioning or history. dibs does not store prior versions (use git for that).
 - Encryption or access control beyond basic POSIX permissions.
