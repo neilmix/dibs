@@ -12,15 +12,9 @@ Uses fuser 0.17 for FUSE bindings (`spawn_mount2` for background sessions).
 
 - **Multi-platform**: no platform-specific code or config. Do not add build workarounds tied to a single OS or architecture.
 
-## Shutdown ordering
-
-The eviction thread holds a raw pointer to `CasTable` inside `DibsFs`. On shutdown, the eviction thread **must** be stopped before the FUSE session is joined/dropped — joining the session drops `DibsFs` and frees the `CasTable`. Reversing this order causes UB (the panic reported with `slice::from_raw_parts`). The real fix is `Arc<CasTable>` — tracked by the TODO in `main.rs`.
+## Eviction thread
 
 The eviction thread sleeps in 1-second ticks (not the full check interval) so it notices the shutdown flag within ~1 second. A previous 60-second sleep was the root cause of the ctrl-C hang bug.
-
-## Known issue: eviction pointer UB
-
-The eviction thread's raw `cas_ptr` is technically dangling from the moment `spawn_mount2` moves `DibsFs` into the FUSE thread. It works in practice because the FUSE thread keeps the allocation alive, but it is UB. The fix is wrapping `CasTable` in an `Arc`. See the TODO comment in `src/main.rs`.
 
 ## Scenario tests
 

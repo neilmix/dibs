@@ -7,6 +7,7 @@ pub mod virtual_dir;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashSet;
@@ -39,11 +40,11 @@ pub struct DibsFs {
     /// Directory handle table.
     pub dir_handles: DirHandleTable,
     /// CAS tracking table.
-    pub cas_table: CasTable,
+    pub cas_table: Arc<CasTable>,
     /// Start time for uptime reporting.
     pub start_time: std::time::Instant,
     /// Expected writes for self-write suppression (used by watcher).
-    pub expected_writes: DashSet<PathBuf>,
+    pub expected_writes: Arc<DashSet<PathBuf>>,
     /// Watcher handle — kept alive for the lifetime of the filesystem.
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// Conflict storage directory in the backing fs.
@@ -67,9 +68,9 @@ impl DibsFs {
             inodes: InodeTable::new(),
             file_handles: HandleTable::new(),
             dir_handles: DirHandleTable::new(),
-            cas_table: CasTable::new(),
+            cas_table: Arc::new(CasTable::new()),
             start_time: std::time::Instant::now(),
-            expected_writes: DashSet::new(),
+            expected_writes: Arc::new(DashSet::new()),
             watcher: Mutex::new(None),
             conflict_dir,
         }

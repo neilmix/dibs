@@ -1,31 +1,26 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use dashmap::DashSet;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tracing::{debug, error};
 
 use crate::fs::DibsFs;
+use crate::state::hash_table::CasTable;
 
 /// Start the filesystem watcher on the backing directory.
 /// This detects external modifications and invalidates CAS entries.
 pub fn start_watcher(fs: &mut DibsFs) {
     let backing = fs.backing.clone();
 
-    // We need raw pointers to access the DibsFs fields from the watcher callback,
-    // because notify requires 'static. This is safe because the watcher is dropped
-    // in DibsFs::destroy() before the DibsFs itself is dropped.
-    let cas_table_ptr = &fs.cas_table as *const _ as usize;
-    let expected_writes_ptr = &fs.expected_writes as *const _ as usize;
+    let cas_table = Arc::clone(&fs.cas_table);
+    let expected_writes = Arc::clone(&fs.expected_writes);
     let backing_clone = backing.clone();
 
     let watcher_result = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        let cas_table =
-            unsafe { &*(cas_table_ptr as *const crate::state::hash_table::CasTable) };
-        let expected_writes =
-            unsafe { &*(expected_writes_ptr as *const dashmap::DashSet<PathBuf>) };
-
         match res {
             Ok(event) => {
-                handle_event(event, cas_table, expected_writes, &backing_clone);
+                handle_event(event, &cas_table, &expected_writes, &backing_clone);
             }
             Err(e) => {
                 error!("Watcher error: {}", e);
@@ -50,8 +45,8 @@ pub fn start_watcher(fs: &mut DibsFs) {
 
 fn handle_event(
     event: Event,
-    cas_table: &crate::state::hash_table::CasTable,
-    expected_writes: &dashmap::DashSet<PathBuf>,
+    cas_table: &CasTable,
+    expected_writes: &DashSet<PathBuf>,
     backing: &PathBuf,
 ) {
     match event.kind {

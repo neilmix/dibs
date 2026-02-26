@@ -43,9 +43,7 @@ fn wait_for_shutdown(guard: &std::thread::JoinHandle<std::io::Result<()>>) -> bo
 
     // Poll the signal pipe with a timeout so we can also notice when the FUSE
     // background thread exits (external unmount). The 200ms timeout means up to
-    // 200ms latency detecting external unmount. On that path, the DibsFs may
-    // already be dropped by the FUSE thread, so the eviction thread's cas_ptr
-    // is dangling — caller must stop eviction ASAP after this returns false.
+    // 200ms latency detecting external unmount.
     let received_signal = loop {
         let mut pfd = libc::pollfd {
             fd: pipe_fds[0],
@@ -176,12 +174,10 @@ fn main() {
             let dibsfs = DibsFs::new(config);
 
             // Start eviction thread
-            // TODO: UB — cas_ptr is taken here but dibsfs is moved into spawn_mount2() below,
-            // invalidating this pointer. CasTable should be behind an Arc to get a stable address.
             let shutdown = Arc::new(AtomicBool::new(false));
-            let cas_ptr = &dibsfs.cas_table as *const _ as *const dibs::state::hash_table::CasTable;
+            let cas_arc = Arc::clone(&dibsfs.cas_table);
             let eviction_handle = dibs::state::eviction::start_eviction_thread(
-                cas_ptr,
+                cas_arc,
                 eviction_minutes,
                 shutdown.clone(),
             );
@@ -238,9 +234,7 @@ fn main() {
 
             let received_signal = wait_for_shutdown(&session.guard);
 
-            // Stop the eviction thread BEFORE joining the session. Joining the
-            // session drops DibsFs (and its CasTable), so the eviction thread's
-            // raw pointer would dangle if it were still running at that point.
+            // Stop the eviction thread before joining the session for clean shutdown.
             shutdown.store(true, Ordering::Relaxed);
             let _ = eviction_handle.join();
 
