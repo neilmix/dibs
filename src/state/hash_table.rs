@@ -144,6 +144,13 @@ impl CasTable {
         }
     }
 
+    /// Check if a file has an active writer.
+    pub fn has_active_writer(&self, path: &Path) -> bool {
+        self.entries
+            .get(path)
+            .is_some_and(|entry| entry.lock().write_owner.is_some())
+    }
+
     /// Remove a file from tracking.
     pub fn remove(&self, path: &Path) {
         self.entries.remove(path);

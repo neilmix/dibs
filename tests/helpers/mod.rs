@@ -65,7 +65,7 @@ impl Drop for TestMount {
     }
 }
 
-fn dibs_binary() -> PathBuf {
+pub fn dibs_binary() -> PathBuf {
     // Look for the binary in the target directory
     let mut path = std::env::current_exe()
         .expect("failed to get test binary path");

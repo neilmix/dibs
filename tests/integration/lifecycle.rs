@@ -12,14 +12,7 @@ fn test_clean_shutdown() {
     fs::write(backing.path().join("test.txt"), "hello").unwrap();
 
     // Start dibs
-    let dibs_bin = {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("target");
-        path.push("x86_64-apple-darwin");
-        path.push("debug");
-        path.push("dibs");
-        path
-    };
+    let dibs_bin = crate::helpers::dibs_binary();
 
     let mut child = Command::new(&dibs_bin)
         .args([

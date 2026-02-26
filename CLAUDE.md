@@ -26,6 +26,10 @@ cargo test --test scenarios -- --ignored --test-threads=1
 
 See `docs/running-scenario-tests.md` for full setup instructions.
 
+## Watcher self-write suppression
+
+Two-layer guard in `src/watcher/mod.rs`. A single FUSE write inserts one entry in `expected_writes`, but the OS may emit multiple FS events (e.g. CREATE + MODIFY for `O_CREAT|O_TRUNC`). Layer 1: `expected_writes.remove()` catches the first event. Layer 2: `cas_table.has_active_writer()` catches subsequent events while the handle still holds write ownership. Both layers must stay in sync — removing either re-introduces the CAS false-positive bug.
+
 ## macFUSE `AutoUnmount` caveat
 
 macFUSE does **not** remove stale mount entries after the FUSE process exits. The mount stays in `mount` output (access returns "Device not configured"). Only `umount -f` clears it. Tests must not assert on automatic mount cleanup — use force-unmount in cleanup instead.

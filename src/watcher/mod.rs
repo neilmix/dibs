@@ -61,6 +61,17 @@ fn handle_event(
                 // Convert to relative path
                 if let Ok(rel) = path.strip_prefix(backing) {
                     let rel_buf = rel.to_path_buf();
+                    // Second suppression layer: a single FUSE op (e.g. create with
+                    // O_CREAT|O_TRUNC) can emit multiple FS events, but only one
+                    // expected_writes entry exists. The active-writer check catches
+                    // the extra events that slip past expected_writes.remove().
+                    if cas_table.has_active_writer(&rel_buf) {
+                        debug!(
+                            "Skipping invalidation for {} (active writer)",
+                            rel_buf.display()
+                        );
+                        continue;
+                    }
                     debug!("External modification detected: {}", rel_buf.display());
                     cas_table.invalidate(&rel_buf);
                 }
