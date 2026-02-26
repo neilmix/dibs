@@ -25,63 +25,59 @@ This works especially well with AI coding tools because they naturally read a fi
 
 ## Quick start
 
+### Prerequisites
+
+A FUSE library must be installed on the host:
+- **macOS**: [macFUSE](https://osxfuse.github.io/) or [FUSE-T](https://www.fuse-t.org/)
+- **Linux**: `libfuse` (e.g. `apt install libfuse-dev` or `dnf install fuse-devel`)
+
 ### Build
 
 ```bash
-cargo build --release
+cargo build
 ```
 
 ### Set up permissions
 
-The backing directory needs to be non-writable by your agents so they can't bypass dibs:
+The backing directory should be non-writable by your agents so they can't bypass dibs. How you do this depends on your OS and setup — standard filesystem permissions or ACLs both work. The key idea: agents read and write through the dibs mount point, not the backing directory directly.
+
+On macOS, [sandbash](https://github.com/neilmix/sandbash) is a good option. It sandboxes a command so it can only write to designated directories. Point it at the mount point and the agent can't touch the backing directory:
 
 ```bash
-# Create a dedicated user for dibs
-sudo useradd -r -s /bin/false dibs
-
-# Change ownership of your project's backing copy
-sudo chown -R dibs:dibs /home/you/myproject
-
-# Allow your user to read but not write
-sudo chmod -R o+rX,o-w /home/you/myproject
+sandbash -w /path/to/mountpoint -- your-agent-command
 ```
 
 ### Mount
 
 ```bash
 # Mount your project through dibs
-dibs mount /home/you/myproject /mnt/myproject
+dibs mount /path/to/project /path/to/mountpoint
 
 # Point your agents at the mount point
-cd /mnt/myproject
+cd /path/to/mountpoint
 ```
 
 ### Run your agents
 
-Start your coding agents targeting `/mnt/myproject`. They'll read and write files normally. dibs handles the rest.
+Start your coding agents targeting the mount point. They'll read and write files normally. dibs handles the rest.
 
 ### Unmount
 
 ```bash
-dibs unmount /mnt/myproject
-# or
-fusermount -u /mnt/myproject
+dibs unmount /path/to/mountpoint
 ```
 
 ## Mount options
 
 ```bash
 dibs mount /path/to/backing /path/to/mount \
-  --session-id "agent-a"      \  # Label for log entries (default: none)
-  --log-file /tmp/dibs.log    \  # Conflict log location (default: /tmp/dibs.log)
+  --session-id "agent-a"      \  # Label for log entries (default: dibs-<pid>)
+  --log-file /tmp/dibs.log    \  # Log file location (default: /tmp/dibs.log)
   --eviction-minutes 60       \  # Evict unused hash entries after N minutes (default: 60)
-  --save-conflicts             \  # Save rejected writes for recovery (default: on)
-  --readonly-fallback          \  # On conflict, silently make fd read-only instead of EIO
+  --save-conflicts               # Save rejected writes for recovery (default: off)
 ```
 
-### A note on `--readonly-fallback`
-
-By default, dibs returns an I/O error (`EIO`) when a write is rejected. Most tools handle this fine. Some don't — they might retry in a loop or crash. If you're hitting that, `--readonly-fallback` silently drops the write instead. It's less correct but more compatible. Try without it first.
+When `--save-conflicts` is enabled, rejected write data is saved to a `.dibs-conflicts/` directory inside the backing directory, with filenames like `20250226_143200_123_api.ts` (timestamp + original filename). This lets you manually recover rejected content.
 
 ## Watching for conflicts
 
@@ -90,42 +86,54 @@ dibs exposes a virtual `.dibs/` directory at the mount root (it doesn't exist in
 **Check what files are currently tracked:**
 
 ```bash
-cat /mnt/myproject/.dibs/locks
+cat /path/to/mountpoint/.dibs/locks
+```
+
+Returns JSON:
+
+```json
+[
+  {
+    "path": "src/auth.ts",
+    "hash": "a1b2c3...",
+    "write_owner": null,
+    "last_access": "2025-02-26T14:30:00Z"
+  },
+  {
+    "path": "src/api.ts",
+    "hash": "d4e5f6...",
+    "write_owner": 42,
+    "last_access": "2025-02-26T14:31:22Z"
+  }
+]
+```
+
+A non-null `write_owner` means a file handle currently has write ownership of that file.
+
+**Check daemon status:**
+
+```bash
+cat /path/to/mountpoint/.dibs/status
 ```
 
 Returns JSON:
 
 ```json
 {
-  "files": {
-    "src/auth.ts": { "hash": "a1b2c3...", "last_read": "2025-02-26T14:30:00Z" },
-    "src/api.ts": { "hash": "d4e5f6...", "last_read": "2025-02-26T14:31:22Z" }
-  }
+  "tracked_files": 12,
+  "active_locks": 1,
+  "uptime_seconds": 3600,
+  "session_id": "agent-a"
 }
 ```
 
-**Check daemon status:**
-
-```bash
-cat /mnt/myproject/.dibs/status
-```
-
-**Review rejected writes:**
-
-```bash
-ls /mnt/myproject/.dibs/conflicts/
-# src_api.ts.2025-02-26T14:32:00Z
-```
-
-These are the contents that were rejected, so you can manually recover them if needed.
-
 ## How agents experience conflicts
 
-When a write is rejected, the agent sees a write failure (EIO or a silent no-op depending on your settings). What happens next depends on the agent:
+When a write is rejected, the agent sees a write failure (EIO). What happens next depends on the agent:
 
 - **Claude Code**: Reports the write failed. You can tell it to re-read the file and adapt.
 - **Aider**: Will typically notice the error and ask what to do.
-- **Cursor / Copilot**: Behavior varies. Test with `--readonly-fallback` if you see issues.
+- **Cursor / Copilot**: Behavior varies.
 
 ## Configuring your agent
 
