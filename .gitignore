@@ -25,3 +25,13 @@
 
 # Claude Code
 .claude/
+
+
+# Added by cargo
+/target
+
+# Local build artifacts
+/.cargo-home/
+/.rustup-home/
+/.local-lib/
+/.cargo/
