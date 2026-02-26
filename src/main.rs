@@ -111,6 +111,18 @@ fn main() {
                 std::process::exit(1);
             });
 
+            // Check for a stale FUSE mount left behind by a previous crash or
+            // forced kill.  macFUSE does not auto-cleanup these.
+            if is_stale_fuse_mount(&mountpoint) {
+                eprintln!(
+                    "Error: {} is a stale FUSE mount (previous dibs session didn't clean up).\n\
+                     Fix with:  umount -f {}",
+                    mountpoint.display(),
+                    mountpoint.display(),
+                );
+                std::process::exit(1);
+            }
+
             let sid = session_id.unwrap_or_else(|| {
                 format!("dibs-{}", std::process::id())
             });
@@ -123,7 +135,11 @@ fn main() {
             let file_appender = tracing_appender::rolling::never(log_dir, log_name);
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
+            let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
             let subscriber = tracing_subscriber::registry()
+                .with(env_filter)
                 .with(
                     fmt::layer()
                         .with_writer(non_blocking)
@@ -246,6 +262,25 @@ fn main() {
             unmount(&mountpoint);
         }
     }
+}
+
+/// Check if `path` is a stale FUSE mount: it appears in `mount` output as a
+/// fuse/macfuse volume but is no longer functional (readdir fails).
+fn is_stale_fuse_mount(path: &std::path::Path) -> bool {
+    let output = match std::process::Command::new("mount").output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path_str = path.to_string_lossy();
+    let is_fuse_mount = stdout.lines().any(|line| {
+        line.contains(path_str.as_ref()) && (line.contains("fuse") || line.contains("macfuse"))
+    });
+    if !is_fuse_mount {
+        return false;
+    }
+    // It's listed as a FUSE mount — check if it's actually functional.
+    std::fs::read_dir(path).is_err()
 }
 
 fn unmount(mountpoint: &PathBuf) {
