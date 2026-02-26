@@ -127,26 +127,6 @@ When a write is rejected, the agent sees a write failure (EIO or a silent no-op 
 - **Aider**: Will typically notice the error and ask what to do.
 - **Cursor / Copilot**: Behavior varies. Test with `--readonly-fallback` if you see issues.
 
-You can also include instructions in your agent's system prompt or custom instructions:
-
-> If a file write fails, another agent may have modified the file. Re-read the file,
-> check what changed, and either adapt your changes to work with the new version
-> or move on to a different task.
-
-## External changes
-
-If you (or git, or a build tool) modify a file in the backing directory directly, dibs detects it via inotify and invalidates the hash entry. The next agent to write that file will be forced to re-read it first. This means `git checkout`, `git pull`, and similar operations work naturally — agents just have to re-read any files they had open.
-
-## Practical tips
-
-**Partition work by file, not by feature.** The locking granularity is per-file. If two agents need to edit the same file for different features, they'll conflict. Give agents tasks that touch different files when possible.
-
-**Use the conflict log.** `tail -f /tmp/dibs.log` in a terminal while your agents work. You'll see conflicts in real time and can intervene if one agent is stuck retrying.
-
-**Don't forget to unmount.** If dibs crashes or you forget to unmount, you'll get "Transport endpoint is not connected" errors. Run `fusermount -u /mnt/myproject` to clean up.
-
-**One server, many agents.** Since all agents work through the same mount (backed by one real directory), you only need one dev server, one set of ports, one `node_modules`. That's the whole point.
-
 ## Configuring your agent
 
 If you're using Claude Code, add something like the following to your project's `CLAUDE.md`. Adapt as needed for other agents' custom instruction mechanisms.
@@ -172,6 +152,20 @@ project simultaneously.
   fail again.
 - Do NOT attempt to write to files outside the mount point or bypass the
   filesystem in any way.
+
+## External changes
+
+If you (or git, or a build tool) modify a file in the backing directory directly, dibs detects it via inotify and invalidates the hash entry. The next agent to write that file will be forced to re-read it first. This means `git checkout`, `git pull`, and similar operations work naturally — agents just have to re-read any files they had open.
+
+## Practical tips
+
+**Partition work by file, not by feature.** The locking granularity is per-file. If two agents need to edit the same file for different features, they'll conflict. Give agents tasks that touch different files when possible.
+
+**Use the conflict log.** `tail -f /tmp/dibs.log` in a terminal while your agents work. You'll see conflicts in real time and can intervene if one agent is stuck retrying.
+
+**Don't forget to unmount.** If dibs crashes or you forget to unmount, you'll get "Transport endpoint is not connected" errors. Run `fusermount -u /mnt/myproject` to clean up.
+
+**One server, many agents.** Since all agents work through the same mount (backed by one real directory), you only need one dev server, one set of ports, one `node_modules`. That's the whole point.
 
 ### How to work effectively
 

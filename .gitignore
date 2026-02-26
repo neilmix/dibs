@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock is optional for libraries, but this is a binary — keep it.
+# Uncomment the next line if this becomes a library crate:
+# Cargo.lock
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# dibs runtime artifacts
+/tmp/
+*.log
+
+# FUSE mount points (sometimes created locally for testing)
+/mnt/
+
+# Claude Code
+.claude/
