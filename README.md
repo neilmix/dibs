@@ -134,51 +134,13 @@ If you're using Claude Code, add something like the following to your project's 
 ```markdown
 ## Concurrent editing (dibs)
 
-This project is mounted through dibs, a filesystem that prevents concurrent edit
-conflicts between multiple agents. You are one of several agents working in this
-project simultaneously.
+This project uses dibs for optimistic file-level concurrency control. Multiple agents work here simultaneously.
 
-### What you need to know
-
-- If a file write fails with an I/O error, it means another agent modified the
-  file after you last read it. Your changes were NOT applied.
-- When this happens:
-  1. Re-read the file to see what changed.
-  2. Decide whether your intended changes are still appropriate given the new content.
-  3. If yes, redo your changes against the new version and write again.
-  4. If the file has changed so much that your task no longer makes sense, stop
-     and tell the user.
-- Do NOT retry a failed write without re-reading the file first. The write will
-  fail again.
-- Do NOT attempt to write to files outside the mount point or bypass the
-  filesystem in any way.
-
-## External changes
-
-If you (or git, or a build tool) modify a file in the backing directory directly, dibs detects it via inotify and invalidates the hash entry. The next agent to write that file will be forced to re-read it first. This means `git checkout`, `git pull`, and similar operations work naturally — agents just have to re-read any files they had open.
-
-## Practical tips
-
-**Partition work by file, not by feature.** The locking granularity is per-file. If two agents need to edit the same file for different features, they'll conflict. Give agents tasks that touch different files when possible.
-
-**Use the conflict log.** `tail -f /tmp/dibs.log` in a terminal while your agents work. You'll see conflicts in real time and can intervene if one agent is stuck retrying.
-
-**Don't forget to unmount.** If dibs crashes or you forget to unmount, you'll get "Transport endpoint is not connected" errors. Run `fusermount -u /mnt/myproject` to clean up.
-
-**One server, many agents.** Since all agents work through the same mount (backed by one real directory), you only need one dev server, one set of ports, one `node_modules`. That's the whole point.
-
-### How to work effectively
-
-- Before starting work, check `.dibs/locks` to see which files other agents are
-  currently working on. Prefer to work on files that are NOT listed there.
-- Keep your changes scoped to as few files as possible.
-- Read a file as close as possible to when you intend to write it. The longer
-  the gap between read and write, the higher the chance of a conflict.
-- If you experience repeated write failures on the same file, tell the user.
-  Another agent is likely actively working on that file and you should be
-  assigned a different task.
-- Prefer creating new files over editing existing shared ones when the design
-  allows it.
+- If a write fails (I/O error), another agent changed the file since you last read it. Your write was NOT applied.
+- On failure: re-read the file, reconcile your changes with the new content, then retry.
+- NEVER retry a failed write without re-reading first — it will fail again.
+- Check `.dibs/locks` before starting to avoid files other agents are actively editing.
+- If you hit repeated write failures on the same file, tell the user.
 ```
 
 Users working with other agents (Aider, Cline, etc.) can adapt this language for their respective configuration files or system prompts.
