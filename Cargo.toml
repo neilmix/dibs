@@ -10,7 +10,6 @@ sha2 = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 dashmap = "6"
 parking_lot = "0.12"
-notify = "7"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

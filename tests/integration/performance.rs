@@ -1,5 +1,5 @@
 use std::fs;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::helpers::TestMount;
 
@@ -13,9 +13,6 @@ fn test_large_file_performance() {
     let backing_file = mount.backing_path().join("large.bin");
     let data: Vec<u8> = (0..15_000_000).map(|i| (i % 256) as u8).collect();
     fs::write(&backing_file, &data).unwrap();
-
-    // Wait for watcher events from backing-dir write to propagate
-    std::thread::sleep(Duration::from_secs(2));
 
     let mount_file = mp.join("large.bin");
 

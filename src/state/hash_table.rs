@@ -11,8 +11,6 @@ use crate::fs::handles::HandleTable;
 
 #[derive(Debug)]
 pub struct FileState {
-    /// Current known hash of the file.
-    pub hash: Option<Vec<u8>>,
     /// File handle that currently owns writes (None if no active writer).
     pub write_owner: Option<u64>,
     /// When this entry was last accessed.
@@ -28,7 +26,6 @@ pub struct ReaderEntry {
 #[derive(Debug, Serialize)]
 pub struct FileStateInfo {
     pub path: String,
-    pub hash: Option<String>,
     pub write_owner: Option<u64>,
     pub last_access: String,
 }
@@ -46,24 +43,9 @@ impl CasTable {
         }
     }
 
-    /// Record that a file was opened for reading. Updates CAS table hash
-    /// and records the reader's SID for later conflict detection.
-    pub fn record_read_open(&self, path: &Path, hash: Vec<u8>, sid: u32) {
-        self.entries
-            .entry(path.to_path_buf())
-            .and_modify(|state| {
-                let mut s = state.lock();
-                s.hash = Some(hash.clone());
-                s.last_access = Utc::now();
-            })
-            .or_insert_with(|| {
-                Mutex::new(FileState {
-                    hash: Some(hash.clone()),
-                    write_owner: None,
-                    last_access: Utc::now(),
-                })
-            });
-
+    /// Record a reader's hash for a (SID, path) pair.
+    /// Called when a file is opened for reading (O_RDONLY or O_RDWR).
+    pub fn record_reader(&self, path: &Path, hash: Vec<u8>, sid: u32) {
         self.reader_hashes.insert(
             (sid, path.to_path_buf()),
             ReaderEntry {
@@ -73,14 +55,13 @@ impl CasTable {
         );
     }
 
-    /// Record that a file was opened for writing only. Ensures the CAS entry
-    /// exists but does NOT update the hash or reader_hashes.
-    pub fn record_write_open(&self, path: &Path) {
+    /// Ensure a write-ownership entry exists for a path.
+    /// Does NOT record any hash — only needed so write_owner can be tracked.
+    pub fn ensure_entry(&self, path: &Path) {
         self.entries
             .entry(path.to_path_buf())
             .or_insert_with(|| {
                 Mutex::new(FileState {
-                    hash: None,
                     write_owner: None,
                     last_access: Utc::now(),
                 })
@@ -88,6 +69,10 @@ impl CasTable {
     }
 
     /// Check CAS and acquire write ownership for a handle.
+    ///
+    /// `actual_hash` is the current hash of the backing file, computed by the caller.
+    /// The CAS check compares this against the reader's hash (what the session last saw).
+    ///
     /// Returns Ok(()) if the write may proceed, Err with description if rejected.
     pub fn check_and_acquire_write(
         &self,
@@ -95,15 +80,12 @@ impl CasTable {
         fh: u64,
         sid: u32,
         handles: &HandleTable,
+        actual_hash: &[u8],
     ) -> Result<(), String> {
-        let entry = match self.entries.get(path) {
-            Some(e) => e,
-            None => {
-                // File not tracked — allow write (new file)
-                return Ok(());
-            }
-        };
+        // Ensure entry exists for write_owner tracking
+        self.ensure_entry(path);
 
+        let entry = self.entries.get(path).unwrap();
         let mut state = entry.lock();
 
         // If this handle already owns the write, let it through
@@ -123,32 +105,28 @@ impl CasTable {
             }
         }
 
-        // CAS check: use handle's hash_at_open (O_RDWR) or reader_hashes (O_WRONLY)
+        // CAS check: compare reader's hash against actual file hash
         if let Some(handle) = handles.get(fh) {
             if let Some(ref handle_hash) = handle.hash_at_open {
-                // O_RDWR case: compare handle's hash_at_open with current CAS hash
-                if let Some(ref current_hash) = state.hash {
-                    if handle_hash != current_hash {
-                        return Err(format!(
-                            "CAS conflict on {}: expected {}, found {}",
-                            path.display(),
-                            cas::hash_hex(handle_hash),
-                            cas::hash_hex(current_hash),
-                        ));
-                    }
+                // O_RDWR case: compare handle's hash_at_open with actual hash
+                if handle_hash != actual_hash {
+                    return Err(format!(
+                        "CAS conflict on {}: expected {}, found {}",
+                        path.display(),
+                        cas::hash_hex(handle_hash),
+                        cas::hash_hex(actual_hash),
+                    ));
                 }
             } else {
                 // O_WRONLY case: look up reader_hashes for this SID
                 if let Some(reader) = self.reader_hashes.get(&(sid, path.to_path_buf())) {
-                    if let Some(ref current_hash) = state.hash {
-                        if reader.hash != *current_hash {
-                            return Err(format!(
-                                "CAS conflict on {}: reader hash {}, current {}",
-                                path.display(),
-                                cas::hash_hex(&reader.hash),
-                                cas::hash_hex(current_hash),
-                            ));
-                        }
+                    if reader.hash != actual_hash {
+                        return Err(format!(
+                            "CAS conflict on {}: reader hash {}, current {}",
+                            path.display(),
+                            cas::hash_hex(&reader.hash),
+                            cas::hash_hex(actual_hash),
+                        ));
                     }
                 }
                 // If no reader entry: blind write — no prior read to conflict with
@@ -173,25 +151,6 @@ impl CasTable {
         }
     }
 
-    /// Update the hash for a file (after a successful write + flush).
-    /// Creates the entry if it doesn't exist.
-    pub fn update_hash(&self, path: &Path, hash: Vec<u8>) {
-        self.entries
-            .entry(path.to_path_buf())
-            .and_modify(|state| {
-                let mut s = state.lock();
-                s.hash = Some(hash.clone());
-                s.last_access = Utc::now();
-            })
-            .or_insert_with(|| {
-                Mutex::new(FileState {
-                    hash: Some(hash),
-                    write_owner: None,
-                    last_access: Utc::now(),
-                })
-            });
-    }
-
     /// Update the reader hash for a SID after a successful write + flush.
     pub fn update_reader(&self, sid: u32, path: &Path, hash: Vec<u8>) {
         self.reader_hashes.insert(
@@ -203,14 +162,11 @@ impl CasTable {
         );
     }
 
-    /// Invalidate a file's hash (e.g., due to external modification).
-    pub fn invalidate(&self, path: &Path) {
-        if let Some(entry) = self.entries.get(path) {
-            let mut state = entry.lock();
-            // Set to a sentinel that will never match any handle's hash_at_open
-            state.hash = Some(vec![0xff; 32]);
-            debug!("Hash invalidated for {}", path.display());
-        }
+    /// Get the reader hash for a (SID, path) pair, if it exists.
+    pub fn get_reader_hash(&self, sid: u32, path: &Path) -> Option<Vec<u8>> {
+        self.reader_hashes
+            .get(&(sid, path.to_path_buf()))
+            .map(|entry| entry.hash.clone())
     }
 
     /// Check if a file has an active writer.
@@ -243,14 +199,6 @@ impl CasTable {
         }
     }
 
-    /// Get the state for a tracked file.
-    pub fn get(
-        &self,
-        path: &Path,
-    ) -> Option<dashmap::mapref::one::Ref<'_, PathBuf, Mutex<FileState>>> {
-        self.entries.get(path)
-    }
-
     /// Number of tracked files.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -275,7 +223,6 @@ impl CasTable {
                 let s = e.value().lock();
                 FileStateInfo {
                     path: e.key().display().to_string(),
-                    hash: s.hash.as_ref().map(|h| cas::hash_hex(h)),
                     write_owner: s.write_owner,
                     last_access: s.last_access.to_rfc3339(),
                 }
@@ -325,30 +272,28 @@ mod tests {
         let h0 = make_hash(0xAA);
 
         // SID 100 reads
-        cas.record_read_open(&path, h0.clone(), 100);
+        cas.record_reader(&path, h0.clone(), 100);
         // SID 200 reads
-        cas.record_read_open(&path, h0.clone(), 200);
+        cas.record_reader(&path, h0.clone(), 200);
 
         // SID 100 opens for write (O_WRONLY → hash_at_open = None)
         let fh1 = handles.alloc(-1, path.clone(), libc::O_WRONLY, None, 100);
-        cas.record_write_open(&path);
+        cas.ensure_entry(&path);
 
-        // SID 100 writes — should succeed
-        let result = cas.check_and_acquire_write(&path, fh1, 100, &handles);
+        // SID 100 writes — actual hash matches reader hash, should succeed
+        let result = cas.check_and_acquire_write(&path, fh1, 100, &handles, &h0);
         assert!(result.is_ok(), "SID 100 write should succeed");
 
-        // Simulate flush: update CAS hash and reader hash
+        // Simulate flush: update reader hash
         let h_a = make_hash(0xBB);
-        cas.update_hash(&path, h_a.clone());
         cas.update_reader(100, &path, h_a.clone());
         cas.release_write(&path, fh1);
 
         // SID 200 opens for write (O_WRONLY → hash_at_open = None)
         let fh2 = handles.alloc(-1, path.clone(), libc::O_WRONLY, None, 200);
-        cas.record_write_open(&path);
 
-        // SID 200 writes — should fail (reader hash 0xAA != CAS hash 0xBB)
-        let result = cas.check_and_acquire_write(&path, fh2, 200, &handles);
+        // SID 200 writes — actual hash is now h_a (0xBB), reader hash is h0 (0xAA)
+        let result = cas.check_and_acquire_write(&path, fh2, 200, &handles, &h_a);
         assert!(result.is_err(), "SID 200 write should fail with CAS conflict");
     }
 
@@ -359,15 +304,15 @@ mod tests {
         let handles = HandleTable::new();
         let path = PathBuf::from("test.txt");
 
-        // File exists in CAS table but no reader entry for SID 300
-        cas.record_read_open(&path, make_hash(0xAA), 100);
+        // File exists in reader_hashes for SID 100, but not SID 300
+        cas.record_reader(&path, make_hash(0xAA), 100);
 
         // SID 300 opens for write without reading first
         let fh = handles.alloc(-1, path.clone(), libc::O_WRONLY, None, 300);
-        cas.record_write_open(&path);
 
         // Should succeed — no reader entry for SID 300, so it's a blind write
-        let result = cas.check_and_acquire_write(&path, fh, 300, &handles);
+        let actual = make_hash(0xBB); // file could be anything
+        let result = cas.check_and_acquire_write(&path, fh, 300, &handles, &actual);
         assert!(result.is_ok(), "Blind write should be allowed");
     }
 
@@ -380,27 +325,24 @@ mod tests {
         let h0 = make_hash(0xAA);
 
         // Read
-        cas.record_read_open(&path, h0.clone(), 100);
+        cas.record_reader(&path, h0.clone(), 100);
 
-        // Write (O_WRONLY)
+        // Write (O_WRONLY) — actual hash matches reader hash
         let fh1 = handles.alloc(-1, path.clone(), libc::O_WRONLY, None, 100);
-        cas.record_write_open(&path);
-        let result = cas.check_and_acquire_write(&path, fh1, 100, &handles);
+        let result = cas.check_and_acquire_write(&path, fh1, 100, &handles, &h0);
         assert!(result.is_ok(), "First write should succeed");
 
         // Flush
         let h1 = make_hash(0xBB);
-        cas.update_hash(&path, h1.clone());
         cas.update_reader(100, &path, h1.clone());
         cas.release_write(&path, fh1);
 
-        // Read again
-        cas.record_read_open(&path, h1.clone(), 100);
+        // Read again (update reader hash)
+        cas.record_reader(&path, h1.clone(), 100);
 
-        // Write again (O_WRONLY)
+        // Write again (O_WRONLY) — actual hash matches new reader hash
         let fh2 = handles.alloc(-1, path.clone(), libc::O_WRONLY, None, 100);
-        cas.record_write_open(&path);
-        let result = cas.check_and_acquire_write(&path, fh2, 100, &handles);
+        let result = cas.check_and_acquire_write(&path, fh2, 100, &handles, &h1);
         assert!(result.is_ok(), "Second write should succeed");
     }
 
@@ -411,8 +353,10 @@ mod tests {
         let path = PathBuf::from("test.txt");
         let h0 = make_hash(0xAA);
 
-        cas.record_read_open(&path, h0.clone(), 100);
-        cas.record_read_open(&path, h0.clone(), 200);
+        cas.record_reader(&path, h0.clone(), 100);
+        cas.record_reader(&path, h0.clone(), 200);
+        // Also create an entry so eviction has something to clean
+        cas.ensure_entry(&path);
 
         assert!(cas.reader_hashes.contains_key(&(100, path.clone())));
         assert!(cas.reader_hashes.contains_key(&(200, path.clone())));
@@ -430,13 +374,12 @@ mod tests {
         let cas = CasTable::new();
         let path = PathBuf::from("test.txt");
 
-        cas.record_read_open(&path, make_hash(0xAA), 100);
-        cas.record_read_open(&path, make_hash(0xAA), 200);
+        cas.record_reader(&path, make_hash(0xAA), 100);
+        cas.record_reader(&path, make_hash(0xAA), 200);
         assert_eq!(cas.reader_hashes.len(), 2);
 
         cas.remove(&path);
         assert_eq!(cas.reader_hashes.len(), 0);
-        assert_eq!(cas.entries.len(), 0);
     }
 
     /// Rename moves reader_hashes
@@ -446,8 +389,9 @@ mod tests {
         let old = PathBuf::from("old.txt");
         let new = PathBuf::from("new.txt");
 
-        cas.record_read_open(&old, make_hash(0xAA), 100);
-        cas.record_read_open(&old, make_hash(0xAA), 200);
+        cas.record_reader(&old, make_hash(0xAA), 100);
+        cas.record_reader(&old, make_hash(0xAA), 200);
+        cas.ensure_entry(&old);
 
         cas.rename(&old, &new);
 
@@ -467,17 +411,16 @@ mod tests {
         let path = PathBuf::from("test.txt");
         let h0 = make_hash(0xAA);
 
-        cas.record_read_open(&path, h0.clone(), 100);
+        cas.record_reader(&path, h0.clone(), 100);
 
         // O_RDWR handle has hash_at_open set
         let fh = handles.alloc(-1, path.clone(), libc::O_RDWR, Some(h0.clone()), 100);
 
-        // Simulate another agent changing the file
+        // Actual file hash has changed (another agent wrote)
         let h1 = make_hash(0xBB);
-        cas.update_hash(&path, h1);
 
-        // Write should fail — hash_at_open (0xAA) != CAS hash (0xBB)
-        let result = cas.check_and_acquire_write(&path, fh, 100, &handles);
-        assert!(result.is_err(), "O_RDWR write should fail when CAS hash changed");
+        // Write should fail — hash_at_open (0xAA) != actual hash (0xBB)
+        let result = cas.check_and_acquire_write(&path, fh, 100, &handles, &h1);
+        assert!(result.is_err(), "O_RDWR write should fail when file hash changed");
     }
 }

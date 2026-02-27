@@ -28,15 +28,18 @@ Without dibs, step 4 silently overwrites A's work. With dibs, step 4 fails becau
 
 ## How conflict detection works
 
+### Re-hash on write
+
+dibs uses a simple principle: **at write time, re-hash the backing file and compare against the reader's hash**. There is no cached "current hash" that needs to be kept in sync. The backing file is always the source of truth.
+
 ### The CAS table
 
 The core data structure is `CasTable` in `src/state/hash_table.rs`. It maintains two maps:
 
-**`entries`**: `DashMap<PathBuf, Mutex<FileState>>` — one entry per tracked file.
+**`entries`**: `DashMap<PathBuf, Mutex<FileState>>` — one entry per tracked file, used only for write ownership tracking.
 
 ```rust
 FileState {
-    hash: Option<Vec<u8>>,       // current content hash (SHA-256 or xxHash)
     write_owner: Option<u64>,    // file handle that currently holds write permission
     last_access: DateTime<Utc>,  // for eviction
 }
@@ -51,7 +54,7 @@ ReaderEntry {
 }
 ```
 
-The `entries` map records what the file actually contains. The `reader_hashes` map records what each session *thinks* the file contains based on their last read. A conflict occurs when these disagree.
+The `reader_hashes` map records what each session *thinks* the file contains based on their last read. A conflict is detected when the reader's hash doesn't match the file's current hash (computed at write time).
 
 ### Session IDs, not PIDs
 
@@ -77,50 +80,47 @@ Here's what happens for a typical read-then-write cycle, annotated with what dib
 ```
 open(O_RDONLY):
     hash = sha256(backing_file)
-    cas_table.entries[path].hash = hash          // update "truth"
-    cas_table.reader_hashes[(sid, path)] = hash  // record what this session saw
+    reader_hashes[(sid, path)] = hash   // record what this session saw
     handle.hash_at_open = Some(hash)
 ```
 
 The reader hash is the session's "receipt" — proof of what it saw.
 
-**Writing a file** (`fs::write` → FUSE `open` with O_WRONLY, then `write`, then `flush`):
+**Writing a file** (`fs::write` → FUSE `open` with O_WRONLY|O_TRUNC, then `write`, then `flush`):
 
 ```
 open(O_WRONLY):
-    cas_table.record_write_open(path)  // ensure entry exists, but DON'T update hash
-    handle.hash_at_open = None         // write-only handle has no hash
+    pre_hash = sha256(backing_file)      // hash BEFORE libc::open (which may truncate)
+    fd = libc::open(path, O_WRONLY|...)  // this may truncate the file
+    handle.hash_at_open = None           // write-only handle has no hash
+
+    // CAS check at open time, using the pre-truncation hash:
+    reader_hash = reader_hashes[(sid, path)]
+    if reader_hash != pre_hash:
+        close(fd); return EIO            // stale view → reject
+    entries[path].write_owner = fh       // claim exclusive write
 
 write(data):
-    check_and_acquire_write(path, fh, sid):
-        reader_hash = reader_hashes[(sid, path)]   // what did this session last read?
-        current_hash = entries[path].hash           // what does the file actually contain?
-        if reader_hash != current_hash:
-            return Err("CAS conflict")              // stale view → reject
-        entries[path].write_owner = fh              // claim exclusive write
+    // write_owner already acquired at open → proceed directly
+    pwrite(fd, data)
 
 flush():
-    new_hash = sha256(backing_file)                 // hash the file after write
-    entries[path].hash = new_hash                   // update truth
-    reader_hashes[(sid, path)] = new_hash           // update this session's receipt
-    entries[path].write_owner = None                // release write lock
+    new_hash = sha256(backing_file)      // hash the file after write
+    reader_hashes[(sid, path)] = new_hash // update this session's receipt
+    entries[path].write_owner = None      // release write lock
 ```
 
-The key insight: `record_write_open` does NOT update the CAS hash. This is what makes conflict detection work. If it updated the hash, every write-mode open would refresh the "truth" to match the file's current state, and the subsequent comparison would always succeed — which is exactly the bug that existed before.
+### Why the CAS check is at open time
 
-### Why write-only opens don't update the hash
+Standard library calls like `fs::write` open the file with `O_WRONLY|O_TRUNC`, which truncates the file to zero bytes as a side effect of `open()`. If the CAS check happened later at `write()` time, the file would already be truncated — its hash would be the empty-file hash, not the pre-truncation content hash. Comparing the reader's hash against the empty-file hash would always fail, even for legitimate writes.
 
-Consider the conflict scenario:
+By checking at open time, before `libc::open` executes the truncation, the comparison is between the reader's hash and the file's actual pre-write content — exactly the right thing.
 
-```
-A reads  → entries[f].hash = H0, reader_hashes[(A, f)] = H0
-B reads  → entries[f].hash = H0, reader_hashes[(B, f)] = H0
-A writes → reader_hashes[(A, f)] = H0 == entries[f].hash = H0 → OK
-           flush: entries[f].hash = H1, reader_hashes[(A, f)] = H1
-B writes → reader_hashes[(B, f)] = H0 != entries[f].hash = H1 → CONFLICT
-```
+For writes that don't involve truncation (rare in practice — most tools use `O_CREAT|O_TRUNC`), there is a fallback CAS check in the `write()` handler that fires if no write ownership was established at open time.
 
-If B's `open(O_WRONLY)` had updated `entries[f].hash` by re-reading the file, it would have set it to H1 (A's version). Then B's reader hash (H0) would fail against H1 — which is correct, the conflict is still detected. But what if the open updated the reader hash too? Then it would be `reader_hashes[(B, f)] = H1`, and the check would pass — silently losing A's work. The separation between "update on read" and "don't update on write" is what makes the whole scheme work.
+### Unlink and rename CAS checks
+
+When a file is deleted (`unlink`) or renamed, dibs checks if the calling session has a reader hash for the file. If so, it re-hashes the backing file and compares. If the file changed since the session last read it, the operation is rejected with `EIO`. If the session never read the file, the operation is allowed.
 
 ### O_RDWR handles
 
@@ -129,40 +129,6 @@ When a file is opened with O_RDWR (read and write simultaneously), the handle ge
 ### Blind writes
 
 If a session writes to a file it never read (no entry in `reader_hashes` for that SID+path, and `hash_at_open` is None), dibs allows it. There's no prior read to conflict with. This handles cases like redirecting output to a new file.
-
-## The file watcher
-
-dibs also needs to detect changes that bypass FUSE entirely — direct edits to the backing directory, `git checkout`, etc. A filesystem watcher (`notify` crate, using FSEvents on macOS / inotify on Linux) monitors the backing directory and invalidates CAS entries when it sees changes.
-
-When the watcher detects a modification, it sets the file's hash to a sentinel value (`[0xff; 32]`) that won't match any real hash. The next write through FUSE will fail the CAS check.
-
-### Self-write suppression
-
-The problem: dibs's own writes to the backing directory also trigger watcher events. Without suppression, every FUSE write would invalidate its own CAS entry.
-
-This is handled by three layers of suppression in `src/watcher/mod.rs`:
-
-**Layer 1: `expected_writes`** (`DashSet<PathBuf>`)
-
-Before writing to the backing file, dibs inserts the path into this set. When the watcher fires, it checks `expected_writes.remove(path)` — if it was there, the event is suppressed.
-
-**Layer 2: `has_active_writer`**
-
-A single FUSE write can generate multiple filesystem events (e.g., CREATE + MODIFY for `O_CREAT|O_TRUNC`). Layer 1 only catches the first because the set contains one entry. Layer 2 checks if the file still has an active write owner — if so, the event is from our ongoing write.
-
-**Layer 3: `recent_self_writes`** (`DashMap<PathBuf, Instant>`)
-
-macOS FSEvents can deliver events with 100ms–1s of latency. By the time the event arrives, flush may have already released write ownership and removed the expected_writes entry. Layer 3 records a timestamp when each file is flushed and suppresses events within 2 seconds.
-
-The complete flow in the watcher:
-
-```
-event arrives for path:
-    if expected_writes.remove(path)     → suppress (Layer 1)
-    if has_active_writer(path)          → suppress (Layer 2)
-    if recent_self_writes[path] < 2s    → suppress (Layer 3)
-    else                                → invalidate CAS entry
-```
 
 ## File hashing
 
@@ -184,7 +150,7 @@ The threshold avoids spending seconds hashing large binary files on every open.
 The mount point contains a virtual `.dibs/` directory (not present in the backing filesystem) that exposes runtime state:
 
 - `.dibs/status` — JSON with tracked file count, active write locks, uptime
-- `.dibs/locks` — JSON array of all CAS entries with hashes and write owners
+- `.dibs/locks` — JSON array of all CAS entries with write owners
 - `.dibs/conflicts/` — directory for saved rejected write data (if `--save-conflicts` is enabled)
 
 These use synthetic inodes and are read-only.
@@ -231,10 +197,8 @@ src/
 │   ├── inodes.rs        InodeTable (inode ↔ path bidirectional map)
 │   ├── passthrough.rs   libc wrappers (stat, fstat, lstat, path conversion)
 │   └── virtual_dir.rs   .dibs/ directory name constants
-├── state/
-│   ├── mod.rs
-│   ├── hash_table.rs    CasTable, FileState, ReaderEntry, conflict detection logic
-│   └── eviction.rs      background eviction thread
-└── watcher/
-    └── mod.rs           filesystem watcher, three-layer self-write suppression
+└── state/
+    ├── mod.rs
+    ├── hash_table.rs    CasTable, FileState, ReaderEntry, conflict detection logic
+    └── eviction.rs      background eviction thread
 ```

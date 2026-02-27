@@ -26,9 +26,11 @@ cargo test --test scenarios -- --ignored --test-threads=1
 
 See `docs/running-scenario-tests.md` for full setup instructions.
 
-## Watcher self-write suppression
+## CAS conflict detection
 
-Two-layer guard in `src/watcher/mod.rs`. A single FUSE write inserts one entry in `expected_writes`, but the OS may emit multiple FS events (e.g. CREATE + MODIFY for `O_CREAT|O_TRUNC`). Layer 1: `expected_writes.remove()` catches the first event. Layer 2: `cas_table.has_active_writer()` catches subsequent events while the handle still holds write ownership. Both layers must stay in sync — removing either re-introduces the CAS false-positive bug.
+CAS checks re-hash the backing file and compare against the reader's hash. No filesystem watcher or hash cache is needed. External modifications (direct edits to the backing directory, `git checkout`, etc.) are detected immediately because the backing file is always the source of truth.
+
+For write-mode opens, the CAS check happens at open time BEFORE `libc::open` (which may truncate the file). The pre-truncation hash is compared against the session's reader hash. O_WRONLY handles must have `hash_at_open = None` so the CAS logic uses `reader_hashes`, not the handle hash.
 
 ## macFUSE `AutoUnmount` caveat
 

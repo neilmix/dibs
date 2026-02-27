@@ -10,14 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dashmap::{DashMap, DashSet};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, RenameFlags,
     Request, TimeOrNow, WriteFlags,
 };
-use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use self::handles::{DirHandleTable, HandleTable};
@@ -49,14 +47,6 @@ pub struct DibsFs {
     pub cas_table: Arc<CasTable>,
     /// Start time for uptime reporting.
     pub start_time: std::time::Instant,
-    /// Expected writes for self-write suppression (used by watcher).
-    pub expected_writes: Arc<DashSet<PathBuf>>,
-    /// Recently flushed self-writes — third suppression layer for delayed
-    /// watcher events that arrive after expected_writes has been consumed
-    /// and the write owner released. Entries expire after 2 seconds.
-    pub recent_self_writes: Arc<DashMap<PathBuf, std::time::Instant>>,
-    /// Watcher handle — kept alive for the lifetime of the filesystem.
-    pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// Conflict storage directory in the backing fs.
     pub conflict_dir: Option<PathBuf>,
 }
@@ -80,9 +70,6 @@ impl DibsFs {
             dir_handles: DirHandleTable::new(),
             cas_table: Arc::new(CasTable::new()),
             start_time: std::time::Instant::now(),
-            expected_writes: Arc::new(DashSet::new()),
-            recent_self_writes: Arc::new(DashMap::new()),
-            watcher: Mutex::new(None),
             conflict_dir,
         }
     }
@@ -202,16 +189,11 @@ impl Filesystem for DibsFs {
         // Register root inode
         self.inodes.insert(1, PathBuf::new());
 
-        // Start file watcher
-        crate::watcher::start_watcher(self);
-
         Ok(())
     }
 
     fn destroy(&mut self) {
         info!("dibs filesystem shutting down");
-        let mut w = self.watcher.lock();
-        *w = None;
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -352,7 +334,8 @@ impl Filesystem for DibsFs {
             if let Some(handle_fh) = fh {
                 let handle_fh = u64::from(handle_fh);
                 let sid = self.file_handles.get(handle_fh).map(|h| h.sid).unwrap_or(0);
-                if let Err(e) = self.cas_table.check_and_acquire_write(&rel, handle_fh, sid, &self.file_handles) {
+                let actual_hash = cas::hash_file(&full).unwrap_or_default();
+                if let Err(e) = self.cas_table.check_and_acquire_write(&rel, handle_fh, sid, &self.file_handles, &actual_hash) {
                     warn!("CAS conflict on truncate: {}", e);
                     reply.error(Errno::EIO);
                     return;
@@ -476,39 +459,61 @@ impl Filesystem for DibsFs {
         };
 
         let access_mode = raw_flags & libc::O_ACCMODE;
+        let sid = get_sid(req.pid());
 
-        // For write-mode opens that may truncate the file, suppress watcher
-        // events BEFORE libc::open (which does the actual truncation).
-        if access_mode != libc::O_RDONLY {
-            self.expected_writes.insert(full.clone());
-            self.recent_self_writes.insert(full.clone(), std::time::Instant::now());
-        }
+        // For write modes, hash the file BEFORE libc::open which may truncate it.
+        // This pre-truncation hash is the actual state we compare against the reader hash.
+        let pre_open_hash = if access_mode != libc::O_RDONLY {
+            cas::hash_file(&full).ok()
+        } else {
+            None
+        };
 
         let fd = unsafe { libc::open(c_path.as_ptr(), raw_flags) };
         if fd < 0 {
-            if access_mode != libc::O_RDONLY {
-                self.expected_writes.remove(&full);
-                self.recent_self_writes.remove(&full);
-            }
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }
 
-        let sid = get_sid(req.pid());
-
-        let hash = if access_mode == libc::O_WRONLY {
-            // Write-only: ensure CAS entry exists but don't update hash
-            self.cas_table.record_write_open(&rel);
-            debug!("open: write-only {} sid={}", rel.display(), sid);
-            None
-        } else {
-            // O_RDONLY or O_RDWR: compute hash, record in CAS and reader_hashes
+        let hash = if access_mode == libc::O_RDONLY {
+            // Read-only: compute hash (file wasn't modified by open), record in reader_hashes
             let h = cas::hash_file(&full).ok();
             if let Some(ref h) = h {
-                self.cas_table.record_read_open(&rel, h.clone(), sid);
+                self.cas_table.record_reader(&rel, h.clone(), sid);
                 debug!("open: tracked {} hash={} sid={}", rel.display(), cas::hash_hex(h), sid);
             }
             h
+        } else {
+            // O_WRONLY or O_RDWR: CAS check using pre-truncation hash, acquire write ownership
+            // O_WRONLY: hash_at_open = None (CAS uses reader_hashes)
+            // O_RDWR: hash_at_open = pre_open_hash (CAS uses hash_at_open directly)
+            let handle_hash = if access_mode == libc::O_RDWR {
+                pre_open_hash.clone()
+            } else {
+                None
+            };
+            let fh = self.file_handles.alloc(fd, rel.clone(), raw_flags, handle_hash, sid);
+            if let Some(ref actual) = pre_open_hash {
+                if let Err(e) = self.cas_table.check_and_acquire_write(&rel, fh, sid, &self.file_handles, actual) {
+                    warn!("CAS conflict on open: {}", e);
+                    self.file_handles.remove(fh);
+                    unsafe { libc::close(fd); }
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            } else {
+                // File didn't exist before open (new file) — ensure entry for write_owner
+                self.cas_table.ensure_entry(&rel);
+            }
+            if access_mode == libc::O_RDWR {
+                // O_RDWR also records in reader_hashes
+                if let Some(ref h) = pre_open_hash {
+                    self.cas_table.record_reader(&rel, h.clone(), sid);
+                }
+            }
+            debug!("open: write-mode {} sid={}", rel.display(), sid);
+            reply.opened(FileHandle(fh), FopenFlags::empty());
+            return;
         };
 
         let fh = self.file_handles.alloc(fd, rel, raw_flags, hash, sid);
@@ -606,23 +611,29 @@ impl Filesystem for DibsFs {
             }
         };
 
-        // CAS check — first write from this handle does the check
-        if let Err(e) = self.cas_table.check_and_acquire_write(&rel_path, fh, sid, &self.file_handles) {
-            warn!("CAS conflict on write: {}", e);
+        // CAS check — if write ownership wasn't already acquired in open(),
+        // re-hash the backing file and compare against the reader hash.
+        // (Normally ownership is acquired at open time; this is a safety net.)
+        if !self.cas_table.has_active_writer(&rel_path) {
+            let full = self.backing_path(&rel_path);
+            let actual_hash = cas::hash_file(&full).unwrap_or_default();
+            if let Err(e) = self.cas_table.check_and_acquire_write(&rel_path, fh, sid, &self.file_handles, &actual_hash) {
+                warn!("CAS conflict on write: {}", e);
 
-            // Save conflict data if configured
-            if let Some(ref conflict_dir) = self.conflict_dir {
-                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
-                let fname = rel_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let conflict_path = conflict_dir.join(format!("{}_{}", ts, fname));
-                let _ = std::fs::write(&conflict_path, data);
+                // Save conflict data if configured
+                if let Some(ref conflict_dir) = self.conflict_dir {
+                    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+                    let fname = rel_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let conflict_path = conflict_dir.join(format!("{}_{}", ts, fname));
+                    let _ = std::fs::write(&conflict_path, data);
+                }
+
+                reply.error(Errno::EIO);
+                return;
             }
-
-            reply.error(Errno::EIO);
-            return;
         }
 
         // Mark handle as having written
@@ -630,16 +641,11 @@ impl Filesystem for DibsFs {
             h.has_written = true;
         }
 
-        // Mark expected write for watcher suppression
-        let full = self.backing_path(&rel_path);
-        self.expected_writes.insert(full.clone());
-
         let n = unsafe {
             libc::pwrite(real_fd, data.as_ptr() as *const libc::c_void, data.len(), offset as libc::off_t)
         };
 
         if n < 0 {
-            self.expected_writes.remove(&full);
             reply.error(Errno::from(std::io::Error::last_os_error()));
         } else {
             reply.written(n as u32);
@@ -665,11 +671,9 @@ impl Filesystem for DibsFs {
         };
 
         if has_written {
-            // Update the hash in the CAS table
+            // Re-hash the file after write and update the reader hash for this SID
             let full = self.backing_path(&rel_path);
             if let Ok(new_hash) = cas::hash_file(&full) {
-                self.cas_table.update_hash(&rel_path, new_hash.clone());
-                // Update reader hash for this SID
                 self.cas_table.update_reader(sid, &rel_path, new_hash.clone());
                 // Update the handle's hash for future checks
                 if let Some(mut h) = self.file_handles.get_mut(fh) {
@@ -680,10 +684,6 @@ impl Filesystem for DibsFs {
             }
             // Release write ownership
             self.cas_table.release_write(&rel_path, fh);
-            // Clear expected write
-            self.expected_writes.remove(&full);
-            // Record for delayed watcher event suppression (Layer 3)
-            self.recent_self_writes.insert(full, std::time::Instant::now());
         }
 
         reply.ok();
@@ -915,14 +915,8 @@ impl Filesystem for DibsFs {
             }
         };
 
-        // Mark expected write for watcher suppression (both layers)
-        self.expected_writes.insert(full.clone());
-        self.recent_self_writes.insert(full.clone(), std::time::Instant::now());
-
         let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_CREAT, mode) };
         if fd < 0 {
-            self.expected_writes.remove(&full);
-            self.recent_self_writes.remove(&full);
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }
@@ -931,7 +925,6 @@ impl Filesystem for DibsFs {
             Ok(st) => st,
             Err(e) => {
                 unsafe { libc::close(fd); }
-                self.expected_writes.remove(&full);
                 reply.error(Errno::from(e));
                 return;
             }
@@ -942,9 +935,10 @@ impl Filesystem for DibsFs {
 
         let sid = get_sid(req.pid());
 
-        // New file has empty hash
-        let hash = vec![];
-        self.cas_table.record_read_open(&rel, hash.clone(), sid);
+        // Hash the newly created file (empty or truncated)
+        let hash = cas::hash_file(&full).unwrap_or_default();
+        self.cas_table.record_reader(&rel, hash.clone(), sid);
+        self.cas_table.ensure_entry(&rel);
         let fh = self.file_handles.alloc(fd, rel, flags, Some(hash), sid);
 
         reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
@@ -976,11 +970,8 @@ impl Filesystem for DibsFs {
             }
         };
 
-        self.expected_writes.insert(full.clone());
-
         let rc = unsafe { libc::mkdir(c_path.as_ptr(), mode as libc::mode_t) };
         if rc != 0 {
-            self.expected_writes.remove(&full);
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }
@@ -991,7 +982,7 @@ impl Filesystem for DibsFs {
         }
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let parent = u64::from(parent);
         debug!("unlink(parent={}, name={:?})", parent, name);
 
@@ -1002,19 +993,18 @@ impl Filesystem for DibsFs {
 
         let (rel, full) = self.resolve_path(parent, name);
 
-        // CAS check for unlink — must have a tracked hash that matches
-        if let Some(state) = self.cas_table.get(&rel) {
-            let state = state.lock();
-            if let Some(ref current_hash) = state.hash {
-                if let Ok(actual_hash) = cas::hash_file(&full) {
-                    if *current_hash != actual_hash {
-                        warn!(
-                            "CAS conflict on unlink {}: file changed since last read",
-                            rel.display()
-                        );
-                        reply.error(Errno::EIO);
-                        return;
-                    }
+        // CAS check: if this session has a reader hash for the file,
+        // verify the file hasn't changed since they last read it.
+        let sid = get_sid(req.pid());
+        if let Some(reader_hash) = self.cas_table.get_reader_hash(sid, &rel) {
+            if let Ok(actual_hash) = cas::hash_file(&full) {
+                if reader_hash != actual_hash {
+                    warn!(
+                        "CAS conflict on unlink {}: file changed since last read",
+                        rel.display()
+                    );
+                    reply.error(Errno::EIO);
+                    return;
                 }
             }
         }
@@ -1027,11 +1017,8 @@ impl Filesystem for DibsFs {
             }
         };
 
-        self.expected_writes.insert(full.clone());
-
         let rc = unsafe { libc::unlink(c_path.as_ptr()) };
         if rc != 0 {
-            self.expected_writes.remove(&full);
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }
@@ -1059,11 +1046,8 @@ impl Filesystem for DibsFs {
             }
         };
 
-        self.expected_writes.insert(full.clone());
-
         let rc = unsafe { libc::rmdir(c_path.as_ptr()) };
         if rc != 0 {
-            self.expected_writes.remove(&full);
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }
@@ -1074,7 +1058,7 @@ impl Filesystem for DibsFs {
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -1097,44 +1081,30 @@ impl Filesystem for DibsFs {
         let (old_rel, old_full) = self.resolve_path(parent, name);
         let (new_rel, new_full) = self.resolve_path(newparent, newname);
 
-        // CAS check for rename — lock in lexicographic order to prevent deadlocks
-        let (_first, _second) = if old_rel <= new_rel {
-            (&old_rel, &new_rel)
-        } else {
-            (&new_rel, &old_rel)
-        };
-
-        // Check source CAS
-        if let Some(state) = self.cas_table.get(&old_rel) {
-            let state = state.lock();
-            if let Some(ref current_hash) = state.hash {
-                if let Ok(actual_hash) = cas::hash_file(&old_full) {
-                    if *current_hash != actual_hash {
-                        warn!(
-                            "CAS conflict on rename source {}: file changed since last read",
-                            old_rel.display()
-                        );
-                        reply.error(Errno::EIO);
-                        return;
-                    }
+        // CAS check: if this session has reader hashes, verify files haven't changed
+        let sid = get_sid(req.pid());
+        if let Some(reader_hash) = self.cas_table.get_reader_hash(sid, &old_rel) {
+            if let Ok(actual_hash) = cas::hash_file(&old_full) {
+                if reader_hash != actual_hash {
+                    warn!(
+                        "CAS conflict on rename source {}: file changed since last read",
+                        old_rel.display()
+                    );
+                    reply.error(Errno::EIO);
+                    return;
                 }
             }
         }
-
-        // Check dest CAS if dest exists and is tracked
         if new_full.exists() {
-            if let Some(state) = self.cas_table.get(&new_rel) {
-                let state = state.lock();
-                if let Some(ref current_hash) = state.hash {
-                    if let Ok(actual_hash) = cas::hash_file(&new_full) {
-                        if *current_hash != actual_hash {
-                            warn!(
-                                "CAS conflict on rename dest {}: file changed since last read",
-                                new_rel.display()
-                            );
-                            reply.error(Errno::EIO);
-                            return;
-                        }
+            if let Some(reader_hash) = self.cas_table.get_reader_hash(sid, &new_rel) {
+                if let Ok(actual_hash) = cas::hash_file(&new_full) {
+                    if reader_hash != actual_hash {
+                        warn!(
+                            "CAS conflict on rename dest {}: file changed since last read",
+                            new_rel.display()
+                        );
+                        reply.error(Errno::EIO);
+                        return;
                     }
                 }
             }
@@ -1155,13 +1125,8 @@ impl Filesystem for DibsFs {
             }
         };
 
-        self.expected_writes.insert(old_full.clone());
-        self.expected_writes.insert(new_full.clone());
-
         let rc = unsafe { libc::rename(old_c.as_ptr(), new_c.as_ptr()) };
         if rc != 0 {
-            self.expected_writes.remove(&old_full);
-            self.expected_writes.remove(&new_full);
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }

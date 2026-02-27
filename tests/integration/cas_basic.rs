@@ -89,7 +89,7 @@ fn test_single_agent_sequential_writes() {
     let mount = TestMount::new();
     let mp = mount.mount_path();
 
-    // Create initial file through the mount (avoids watcher race)
+    // Create initial file through the mount
     let mount_file = mp.join("sequential.txt");
     fs::write(&mount_file, "version 1").unwrap();
 
@@ -118,7 +118,7 @@ fn test_different_files_no_conflict() {
     let mount = TestMount::new();
     let mp = mount.mount_path();
 
-    // Create two files through the mount (avoids watcher race)
+    // Create two files through the mount
     let mount_a = mp.join("file_a.txt");
     let mount_b = mp.join("file_b.txt");
     fs::write(&mount_a, "content A").unwrap();
