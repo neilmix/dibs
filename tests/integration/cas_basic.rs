@@ -1,34 +1,86 @@
 use std::fs;
+use std::process::Command;
+use std::time::Duration;
 
-use crate::helpers::TestMount;
+use crate::helpers::{wait_for_file, test_agent_binary, TestMount};
 
-/// Test 1: Two concurrent writers — first succeeds, second rejected.
+/// Test 1: Two concurrent writers (separate processes/SIDs) — first succeeds, second rejected.
 #[test]
 fn test_concurrent_writers_second_rejected() {
     let mount = TestMount::new();
     let mp = mount.mount_path();
+    let sync_dir = tempfile::tempdir().unwrap();
 
     // Create a file through the backing dir
     let backing_file = mount.backing_path().join("test.txt");
     fs::write(&backing_file, "initial content").unwrap();
 
     let mount_file = mp.join("test.txt");
+    let agent_bin = test_agent_binary();
 
-    // Agent A opens and reads
-    let content_a = fs::read_to_string(&mount_file).unwrap();
-    assert_eq!(content_a, "initial content");
+    // Spawn Agent A (gets its own SID via setsid)
+    let mut agent_a = Command::new(&agent_bin)
+        .args([
+            mount_file.to_str().unwrap(),
+            sync_dir.path().to_str().unwrap(),
+            "a",
+            "modified by A",
+        ])
+        .spawn()
+        .expect("failed to spawn agent A");
 
-    // Agent B opens and reads
-    let content_b = fs::read_to_string(&mount_file).unwrap();
-    assert_eq!(content_b, "initial content");
+    // Wait for A to read and signal ready
+    assert!(
+        wait_for_file(&sync_dir.path().join("a.ready"), Duration::from_secs(10)),
+        "Agent A did not become ready"
+    );
 
-    // Agent A writes — should succeed
-    let result_a = fs::write(&mount_file, "modified by A");
-    assert!(result_a.is_ok(), "Agent A write should succeed");
+    // Spawn Agent B (gets its own SID via setsid)
+    let mut agent_b = Command::new(&agent_bin)
+        .args([
+            mount_file.to_str().unwrap(),
+            sync_dir.path().to_str().unwrap(),
+            "b",
+            "modified by B",
+        ])
+        .spawn()
+        .expect("failed to spawn agent B");
 
-    // Agent B writes — should fail with EIO (hash mismatch)
-    let result_b = fs::write(&mount_file, "modified by B");
-    assert!(result_b.is_err(), "Agent B write should fail (CAS conflict)");
+    // Wait for B to read and signal ready
+    assert!(
+        wait_for_file(&sync_dir.path().join("b.ready"), Duration::from_secs(10)),
+        "Agent B did not become ready"
+    );
+
+    // Signal A to write
+    fs::write(sync_dir.path().join("a.go"), "").unwrap();
+
+    // Wait for A's result
+    assert!(
+        wait_for_file(&sync_dir.path().join("a.result"), Duration::from_secs(10)),
+        "Agent A did not produce a result"
+    );
+    let a_result = fs::read_to_string(sync_dir.path().join("a.result")).unwrap();
+
+    // Signal B to write
+    fs::write(sync_dir.path().join("b.go"), "").unwrap();
+
+    // Wait for B's result
+    assert!(
+        wait_for_file(&sync_dir.path().join("b.result"), Duration::from_secs(10)),
+        "Agent B did not produce a result"
+    );
+    let b_result = fs::read_to_string(sync_dir.path().join("b.result")).unwrap();
+
+    let _ = agent_a.wait();
+    let _ = agent_b.wait();
+
+    assert_eq!(a_result, "ok", "Agent A write should succeed");
+    assert!(
+        b_result.starts_with("error"),
+        "Agent B write should fail (CAS conflict), got: {}",
+        b_result
+    );
 }
 
 /// Test 2: Read-write-read-write single agent — both succeed.
@@ -37,11 +89,9 @@ fn test_single_agent_sequential_writes() {
     let mount = TestMount::new();
     let mp = mount.mount_path();
 
-    // Create initial file
-    let backing_file = mount.backing_path().join("sequential.txt");
-    fs::write(&backing_file, "version 1").unwrap();
-
+    // Create initial file through the mount (avoids watcher race)
     let mount_file = mp.join("sequential.txt");
+    fs::write(&mount_file, "version 1").unwrap();
 
     // Read
     let content = fs::read_to_string(&mount_file).unwrap();
@@ -68,14 +118,11 @@ fn test_different_files_no_conflict() {
     let mount = TestMount::new();
     let mp = mount.mount_path();
 
-    // Create two files
-    let backing_a = mount.backing_path().join("file_a.txt");
-    let backing_b = mount.backing_path().join("file_b.txt");
-    fs::write(&backing_a, "content A").unwrap();
-    fs::write(&backing_b, "content B").unwrap();
-
+    // Create two files through the mount (avoids watcher race)
     let mount_a = mp.join("file_a.txt");
     let mount_b = mp.join("file_b.txt");
+    fs::write(&mount_a, "content A").unwrap();
+    fs::write(&mount_b, "content B").unwrap();
 
     // Agent A reads file_a
     let _ = fs::read_to_string(&mount_a).unwrap();
@@ -88,29 +135,76 @@ fn test_different_files_no_conflict() {
     assert!(fs::write(&mount_b, "new B").is_ok());
 }
 
-/// Test 5: A reads, B reads, A writes (ok), B writes (rejected).
+/// Test 5: A reads, B reads, A writes (ok), B writes (rejected) — using separate processes.
 #[test]
 fn test_ordered_concurrent_access() {
     let mount = TestMount::new();
     let mp = mount.mount_path();
+    let sync_dir = tempfile::tempdir().unwrap();
 
     let backing_file = mount.backing_path().join("ordered.txt");
     fs::write(&backing_file, "original").unwrap();
 
     let mount_file = mp.join("ordered.txt");
+    let agent_bin = test_agent_binary();
 
-    // A reads
-    let _ = fs::read_to_string(&mount_file).unwrap();
+    // Spawn A
+    let mut agent_a = Command::new(&agent_bin)
+        .args([
+            mount_file.to_str().unwrap(),
+            sync_dir.path().to_str().unwrap(),
+            "a",
+            "A wrote this",
+        ])
+        .spawn()
+        .expect("failed to spawn agent A");
 
-    // B reads
-    let _ = fs::read_to_string(&mount_file).unwrap();
+    assert!(
+        wait_for_file(&sync_dir.path().join("a.ready"), Duration::from_secs(10)),
+        "Agent A did not become ready"
+    );
 
-    // A writes — succeeds
-    assert!(fs::write(&mount_file, "A wrote this").is_ok());
+    // Spawn B
+    let mut agent_b = Command::new(&agent_bin)
+        .args([
+            mount_file.to_str().unwrap(),
+            sync_dir.path().to_str().unwrap(),
+            "b",
+            "B wrote this",
+        ])
+        .spawn()
+        .expect("failed to spawn agent B");
 
-    // B writes — should fail (A changed the file)
-    let result = fs::write(&mount_file, "B wrote this");
-    assert!(result.is_err(), "B's write should fail after A modified the file");
+    assert!(
+        wait_for_file(&sync_dir.path().join("b.ready"), Duration::from_secs(10)),
+        "Agent B did not become ready"
+    );
+
+    // A writes first
+    fs::write(sync_dir.path().join("a.go"), "").unwrap();
+    assert!(
+        wait_for_file(&sync_dir.path().join("a.result"), Duration::from_secs(10)),
+        "Agent A did not produce a result"
+    );
+    let a_result = fs::read_to_string(sync_dir.path().join("a.result")).unwrap();
+
+    // B writes second
+    fs::write(sync_dir.path().join("b.go"), "").unwrap();
+    assert!(
+        wait_for_file(&sync_dir.path().join("b.result"), Duration::from_secs(10)),
+        "Agent B did not produce a result"
+    );
+    let b_result = fs::read_to_string(sync_dir.path().join("b.result")).unwrap();
+
+    let _ = agent_a.wait();
+    let _ = agent_b.wait();
+
+    assert_eq!(a_result, "ok", "A's write should succeed");
+    assert!(
+        b_result.starts_with("error"),
+        "B's write should fail after A modified the file, got: {}",
+        b_result
+    );
 }
 
 /// Test 6: Two creates with different names — both succeed.

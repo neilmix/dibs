@@ -26,8 +26,8 @@ fn test_clean_shutdown() {
         .spawn()
         .expect("failed to start dibs");
 
-    // Wait for mount
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for mount (longer when running in parallel with other FUSE tests)
+    std::thread::sleep(Duration::from_secs(5));
 
     // Verify mount works
     let files: Vec<_> = fs::read_dir(mount_dir.path())

@@ -22,6 +22,10 @@ libc = "0.2"
 nix = { version = "0.29", features = ["signal", "fs"] }
 thiserror = "2"
 
+[[bin]]
+name = "dibs-test-agent"
+path = "tests/helpers/test_agent.rs"
+
 [dev-dependencies]
 tempfile = "3"
 rand = "0.8"

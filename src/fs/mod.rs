@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
@@ -29,6 +29,12 @@ use crate::state::hash_table::CasTable;
 
 const TTL: Duration = Duration::from_secs(1);
 
+/// Get the session ID for a given PID. Falls back to the PID itself on error.
+fn get_sid(pid: u32) -> u32 {
+    let sid = unsafe { libc::getsid(pid as i32) };
+    if sid < 0 { pid } else { sid as u32 }
+}
+
 pub struct DibsFs {
     pub config: DibsConfig,
     /// The backing directory root.
@@ -45,6 +51,10 @@ pub struct DibsFs {
     pub start_time: std::time::Instant,
     /// Expected writes for self-write suppression (used by watcher).
     pub expected_writes: Arc<DashSet<PathBuf>>,
+    /// Recently flushed self-writes — third suppression layer for delayed
+    /// watcher events that arrive after expected_writes has been consumed
+    /// and the write owner released. Entries expire after 2 seconds.
+    pub recent_self_writes: Arc<DashMap<PathBuf, std::time::Instant>>,
     /// Watcher handle — kept alive for the lifetime of the filesystem.
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// Conflict storage directory in the backing fs.
@@ -71,6 +81,7 @@ impl DibsFs {
             cas_table: Arc::new(CasTable::new()),
             start_time: std::time::Instant::now(),
             expected_writes: Arc::new(DashSet::new()),
+            recent_self_writes: Arc::new(DashMap::new()),
             watcher: Mutex::new(None),
             conflict_dir,
         }
@@ -340,7 +351,8 @@ impl Filesystem for DibsFs {
         if let Some(new_size) = size {
             if let Some(handle_fh) = fh {
                 let handle_fh = u64::from(handle_fh);
-                if let Err(e) = self.cas_table.check_and_acquire_write(&rel, handle_fh, &self.file_handles) {
+                let sid = self.file_handles.get(handle_fh).map(|h| h.sid).unwrap_or(0);
+                if let Err(e) = self.cas_table.check_and_acquire_write(&rel, handle_fh, sid, &self.file_handles) {
                     warn!("CAS conflict on truncate: {}", e);
                     reply.error(Errno::EIO);
                     return;
@@ -431,14 +443,14 @@ impl Filesystem for DibsFs {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let ino = u64::from(ino);
         let raw_flags = flags.0;
         debug!("open(ino={}, flags={})", ino, raw_flags);
 
         // Virtual files
         if ino == DIBS_STATUS_INO || ino == DIBS_LOCKS_INO {
-            let fh = self.file_handles.alloc(-1, PathBuf::from(".dibs/virtual"), raw_flags, None);
+            let fh = self.file_handles.alloc(-1, PathBuf::from(".dibs/virtual"), raw_flags, None, 0);
             reply.opened(FileHandle(fh), FopenFlags::empty());
             return;
         }
@@ -463,20 +475,43 @@ impl Filesystem for DibsFs {
             }
         };
 
+        let access_mode = raw_flags & libc::O_ACCMODE;
+
+        // For write-mode opens that may truncate the file, suppress watcher
+        // events BEFORE libc::open (which does the actual truncation).
+        if access_mode != libc::O_RDONLY {
+            self.expected_writes.insert(full.clone());
+            self.recent_self_writes.insert(full.clone(), std::time::Instant::now());
+        }
+
         let fd = unsafe { libc::open(c_path.as_ptr(), raw_flags) };
         if fd < 0 {
+            if access_mode != libc::O_RDONLY {
+                self.expected_writes.remove(&full);
+                self.recent_self_writes.remove(&full);
+            }
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }
 
-        // Compute hash for CAS tracking
-        let hash = cas::hash_file(&full).ok();
-        if let Some(ref h) = hash {
-            self.cas_table.record_open(&rel, h.clone());
-            debug!("open: tracked {} hash={}", rel.display(), cas::hash_hex(h));
-        }
+        let sid = get_sid(req.pid());
 
-        let fh = self.file_handles.alloc(fd, rel, raw_flags, hash);
+        let hash = if access_mode == libc::O_WRONLY {
+            // Write-only: ensure CAS entry exists but don't update hash
+            self.cas_table.record_write_open(&rel);
+            debug!("open: write-only {} sid={}", rel.display(), sid);
+            None
+        } else {
+            // O_RDONLY or O_RDWR: compute hash, record in CAS and reader_hashes
+            let h = cas::hash_file(&full).ok();
+            if let Some(ref h) = h {
+                self.cas_table.record_read_open(&rel, h.clone(), sid);
+                debug!("open: tracked {} hash={} sid={}", rel.display(), cas::hash_hex(h), sid);
+            }
+            h
+        };
+
+        let fh = self.file_handles.alloc(fd, rel, raw_flags, hash, sid);
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
@@ -562,9 +597,9 @@ impl Filesystem for DibsFs {
             return;
         }
 
-        // Get the handle's path for CAS check
-        let (real_fd, rel_path) = match self.file_handles.get(fh) {
-            Some(h) => (h.real_fd, h.path.clone()),
+        // Get the handle's path and SID for CAS check
+        let (real_fd, rel_path, sid) = match self.file_handles.get(fh) {
+            Some(h) => (h.real_fd, h.path.clone(), h.sid),
             None => {
                 reply.error(Errno::EBADF);
                 return;
@@ -572,7 +607,7 @@ impl Filesystem for DibsFs {
         };
 
         // CAS check — first write from this handle does the check
-        if let Err(e) = self.cas_table.check_and_acquire_write(&rel_path, fh, &self.file_handles) {
+        if let Err(e) = self.cas_table.check_and_acquire_write(&rel_path, fh, sid, &self.file_handles) {
             warn!("CAS conflict on write: {}", e);
 
             // Save conflict data if configured
@@ -621,8 +656,8 @@ impl Filesystem for DibsFs {
             return;
         }
 
-        let (has_written, rel_path) = match self.file_handles.get(fh) {
-            Some(h) => (h.has_written, h.path.clone()),
+        let (has_written, rel_path, sid) = match self.file_handles.get(fh) {
+            Some(h) => (h.has_written, h.path.clone(), h.sid),
             None => {
                 reply.ok();
                 return;
@@ -634,17 +669,21 @@ impl Filesystem for DibsFs {
             let full = self.backing_path(&rel_path);
             if let Ok(new_hash) = cas::hash_file(&full) {
                 self.cas_table.update_hash(&rel_path, new_hash.clone());
+                // Update reader hash for this SID
+                self.cas_table.update_reader(sid, &rel_path, new_hash.clone());
                 // Update the handle's hash for future checks
                 if let Some(mut h) = self.file_handles.get_mut(fh) {
                     h.hash_at_open = Some(new_hash);
                     h.has_written = false;
                 }
-                debug!("flush: updated hash for {}", rel_path.display());
+                debug!("flush: updated hash for {} sid={}", rel_path.display(), sid);
             }
             // Release write ownership
             self.cas_table.release_write(&rel_path, fh);
             // Clear expected write
             self.expected_writes.remove(&full);
+            // Record for delayed watcher event suppression (Layer 3)
+            self.recent_self_writes.insert(full, std::time::Instant::now());
         }
 
         reply.ok();
@@ -851,7 +890,7 @@ impl Filesystem for DibsFs {
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -876,12 +915,14 @@ impl Filesystem for DibsFs {
             }
         };
 
-        // Mark expected write for watcher suppression
+        // Mark expected write for watcher suppression (both layers)
         self.expected_writes.insert(full.clone());
+        self.recent_self_writes.insert(full.clone(), std::time::Instant::now());
 
         let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_CREAT, mode) };
         if fd < 0 {
             self.expected_writes.remove(&full);
+            self.recent_self_writes.remove(&full);
             reply.error(Errno::from(std::io::Error::last_os_error()));
             return;
         }
@@ -899,10 +940,12 @@ impl Filesystem for DibsFs {
         let attr = stat_to_file_attr(&st);
         self.inodes.insert(u64::from(attr.ino), rel.clone());
 
+        let sid = get_sid(req.pid());
+
         // New file has empty hash
         let hash = vec![];
-        self.cas_table.record_open(&rel, hash.clone());
-        let fh = self.file_handles.alloc(fd, rel, flags, Some(hash));
+        self.cas_table.record_read_open(&rel, hash.clone(), sid);
+        let fh = self.file_handles.alloc(fd, rel, flags, Some(hash), sid);
 
         reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
     }

@@ -89,6 +89,30 @@ pub fn dibs_binary() -> PathBuf {
     PathBuf::from("target/debug/dibs")
 }
 
+pub fn test_agent_binary() -> PathBuf {
+    let mut path = std::env::current_exe()
+        .expect("failed to get test binary path");
+    path.pop(); // remove binary name
+    path.pop(); // remove deps/
+    path.push("dibs-test-agent");
+    if path.exists() {
+        return path;
+    }
+    PathBuf::from("target/debug/dibs-test-agent")
+}
+
+/// Wait for a file to appear, with timeout.
+pub fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn wait_for_mount(mount_path: &Path) {
     for _ in 0..50 {
         // Check if the mount point has the FUSE filesystem

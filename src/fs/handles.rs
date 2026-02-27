@@ -17,6 +17,8 @@ pub struct HandleState {
     pub flags: i32,
     /// Whether this handle has been used for writing.
     pub has_written: bool,
+    /// Session ID of the process that opened this handle.
+    pub sid: u32,
 }
 
 pub struct HandleTable {
@@ -32,7 +34,7 @@ impl HandleTable {
         }
     }
 
-    pub fn alloc(&self, real_fd: RawFd, path: PathBuf, flags: i32, hash: Option<Vec<u8>>) -> u64 {
+    pub fn alloc(&self, real_fd: RawFd, path: PathBuf, flags: i32, hash: Option<Vec<u8>>, sid: u32) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let state = HandleState {
             fh,
@@ -41,6 +43,7 @@ impl HandleTable {
             hash_at_open: hash,
             flags,
             has_written: false,
+            sid,
         };
         self.handles.insert(fh, state);
         fh
