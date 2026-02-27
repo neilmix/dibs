@@ -23,6 +23,10 @@ Agent B gets an I/O error. It has to re-read the file and decide what to do. The
 
 This works especially well with AI coding tools because they naturally read a file, spend a while thinking, then write the whole file back — which maps perfectly to the read-hash-write cycle.
 
+## Project status
+
+ALPHA. This has only been tried minimally on MacOS. Pull requests welcome.
+
 ## Quick start
 
 ### Prerequisites

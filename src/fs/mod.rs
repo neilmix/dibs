@@ -40,9 +40,9 @@ pub struct DibsFs {
     /// Inode table mapping inodes <-> paths (relative to backing root).
     pub inodes: InodeTable,
     /// File handle table.
-    pub file_handles: HandleTable,
+    pub file_handles: Arc<HandleTable>,
     /// Directory handle table.
-    pub dir_handles: DirHandleTable,
+    pub dir_handles: Arc<DirHandleTable>,
     /// CAS tracking table.
     pub cas_table: Arc<CasTable>,
     /// Start time for uptime reporting.
@@ -66,8 +66,8 @@ impl DibsFs {
             config,
             backing,
             inodes: InodeTable::new(),
-            file_handles: HandleTable::new(),
-            dir_handles: DirHandleTable::new(),
+            file_handles: Arc::new(HandleTable::new()),
+            dir_handles: Arc::new(DirHandleTable::new()),
             cas_table: Arc::new(CasTable::new()),
             start_time: std::time::Instant::now(),
             conflict_dir,

@@ -18,7 +18,7 @@ The eviction thread sleeps in 1-second ticks (not the full check interval) so it
 
 ## Scenario tests
 
-`tests/scenarios.rs` — 10 integration tests covering all shutdown paths (ctrl-C, external unmount, busy mount, SIGKILL, etc.). Requires real FUSE; ignored by default.
+`tests/scenarios.rs` — 13 integration tests covering all shutdown paths (ctrl-C, external unmount, busy mount, SIGKILL, two-phase shutdown, etc.). Requires real FUSE; ignored by default.
 
 ```
 cargo test --test scenarios -- --ignored --test-threads=1
@@ -31,6 +31,10 @@ See `docs/running-scenario-tests.md` for full setup instructions.
 CAS checks re-hash the backing file and compare against the reader's hash. No filesystem watcher or hash cache is needed. External modifications (direct edits to the backing directory, `git checkout`, etc.) are detected immediately because the backing file is always the source of truth.
 
 For write-mode opens, the CAS check happens at open time BEFORE `libc::open` (which may truncate the file). The pre-truncation hash is compared against the session's reader hash. O_WRONLY handles must have `hash_at_open = None` so the CAS logic uses `reader_hashes`, not the handle hash.
+
+## Two-phase ctrl-C shutdown
+
+First ctrl-C probes mount busyness via a regular (non-forced) `umount`. If the mount is not busy, it unmounts immediately. If busy (open file handles, CWD references, etc.), it prints a warning listing open FUSE handles and waits. A periodic `umount` probe (~1s) detects when the mount becomes free and auto-unmounts. Second ctrl-C force-unmounts immediately. Scenarios 2, 11–13 in `tests/scenarios.rs` cover the two-phase paths.
 
 ## macFUSE `AutoUnmount` caveat
 

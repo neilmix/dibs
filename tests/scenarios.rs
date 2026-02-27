@@ -5,6 +5,7 @@
 //!
 //!     cargo test --test scenarios -- --ignored --test-threads=1
 
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -255,9 +256,9 @@ fn scenario_01_ctrl_c_not_busy() {
 
 /// Scenario 2: ctrl-C when the mount is busy (a process has its cwd inside).
 ///
-/// FUSE mounts can be torn down even when busy — the kernel removes the mount
-/// and in-flight operations on the mount get I/O errors.  So ctrl-C should
-/// still be prompt.
+/// Two-phase shutdown: first ctrl-C warns that the mount is busy, second
+/// ctrl-C force-unmounts.  The busy process (CWD in mount) prevents a clean
+/// unmount, which is detected by the `umount` probe.
 #[test]
 #[ignore]
 fn scenario_02_ctrl_c_busy() {
@@ -266,31 +267,30 @@ fn scenario_02_ctrl_c_busy() {
 
     let mut busy = hold_busy(dibs.mountpoint());
 
-    let t0 = Instant::now();
+    // First ctrl-C — should warn about busy mount.
+    dibs.send_signal(libc::SIGINT);
+
+    assert!(
+        dibs.wait_for_stderr("mount is busy", Duration::from_secs(3)),
+        "missing 'mount is busy' warning:\n{}",
+        dibs.stderr_snapshot().join("\n"),
+    );
+    assert!(dibs.is_running(), "dibs should still be running after first ctrl-C");
+
+    // Second ctrl-C — should force unmount.
     dibs.send_signal(libc::SIGINT);
 
     let status = dibs
         .wait_with_timeout(Duration::from_secs(3))
-        .expect("dibs did not exit within 3s of SIGINT (mount was busy)");
-
-    let elapsed = t0.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "exit took too long: {:?}",
-        elapsed,
-    );
+        .expect("dibs did not exit within 3s of second SIGINT");
     assert!(status.success(), "expected exit 0, got {:?}", status);
     assert!(
-        dibs.stderr_contains("unmounting (received signal)"),
-        "missing 'unmounting' message",
+        dibs.stderr_contains("force unmounting"),
+        "missing 'force unmounting' message:\n{}",
+        dibs.stderr_snapshot().join("\n"),
     );
-    assert!(dibs.stderr_contains("unmounted"), "missing 'unmounted' message");
 
     kill_child(&mut busy);
-    // Note: the stale mount entry may linger in `mount` output after the FUSE
-    // process exits — AutoUnmount behavior varies by FUSE implementation.
-    // The Drop impl force-unmounts as cleanup.  The important assertion above
-    // is that the *process* exited promptly.
 }
 
 /// Scenario 3: external unmount via `dibs unmount`, mount not busy.
@@ -540,4 +540,120 @@ fn scenario_10_sigkill() {
         "stale mount should not be accessible, but read_dir succeeded",
     );
     // Drop impl will force-unmount.
+}
+
+/// Scenario 11: ctrl-C with open file handles.
+///
+/// First ctrl-C should warn about open files and keep running.
+/// Second ctrl-C should force unmount and exit.
+#[test]
+#[ignore]
+fn scenario_11_ctrl_c_open_handles() {
+    let mut dibs = DibsMount::start();
+    dibs.wait_for_mount(Duration::from_secs(5));
+
+    // Open a file through the mount to create an open FUSE handle.
+    let _file = File::open(dibs.mountpoint().join("hello.txt"))
+        .expect("failed to open hello.txt through mount");
+
+    // First ctrl-C — should warn about open files.
+    dibs.send_signal(libc::SIGINT);
+
+    assert!(
+        dibs.wait_for_stderr("mount is busy", Duration::from_secs(3)),
+        "missing 'mount is busy' warning:\n{}",
+        dibs.stderr_snapshot().join("\n"),
+    );
+    assert!(dibs.is_running(), "dibs should still be running after first ctrl-C");
+
+    // Second ctrl-C — should force unmount.
+    dibs.send_signal(libc::SIGINT);
+
+    let status = dibs
+        .wait_with_timeout(Duration::from_secs(3))
+        .expect("dibs did not exit after second SIGINT");
+    assert!(status.success(), "expected exit 0, got {:?}", status);
+    assert!(
+        dibs.stderr_contains("force unmounting"),
+        "missing 'force unmounting' message:\n{}",
+        dibs.stderr_snapshot().join("\n"),
+    );
+}
+
+/// Scenario 12: ctrl-C with open handles, then files close → auto-unmount.
+///
+/// First ctrl-C warns. Dropping the file handle should trigger automatic
+/// clean unmount without needing a second signal.  The periodic `umount`
+/// probe detects the mount is no longer busy.
+#[test]
+#[ignore]
+fn scenario_12_ctrl_c_then_files_close() {
+    let mut dibs = DibsMount::start();
+    dibs.wait_for_mount(Duration::from_secs(5));
+
+    // Open a file through the mount.
+    let file = File::open(dibs.mountpoint().join("hello.txt"))
+        .expect("failed to open hello.txt through mount");
+
+    // First ctrl-C — should warn.
+    dibs.send_signal(libc::SIGINT);
+
+    assert!(
+        dibs.wait_for_stderr("mount is busy", Duration::from_secs(3)),
+        "missing 'mount is busy' warning:\n{}",
+        dibs.stderr_snapshot().join("\n"),
+    );
+    assert!(dibs.is_running(), "dibs should still be running after first ctrl-C");
+
+    // Close the file handle — mount should become not-busy.
+    drop(file);
+
+    // The periodic umount probe (~1s interval) detects the mount is free.
+    assert!(
+        dibs.wait_for_stderr("all clear", Duration::from_secs(5)),
+        "missing 'all clear' message:\n{}",
+        dibs.stderr_snapshot().join("\n"),
+    );
+
+    let status = dibs
+        .wait_with_timeout(Duration::from_secs(3))
+        .expect("dibs did not exit after files closed");
+    assert!(status.success(), "expected exit 0, got {:?}", status);
+}
+
+/// Scenario 13: SIGTERM with open file handles.
+///
+/// Identical behavior to ctrl-C (scenario 11) — first SIGTERM warns,
+/// second SIGTERM forces unmount.
+#[test]
+#[ignore]
+fn scenario_13_sigterm_open_handles() {
+    let mut dibs = DibsMount::start();
+    dibs.wait_for_mount(Duration::from_secs(5));
+
+    let _file = File::open(dibs.mountpoint().join("hello.txt"))
+        .expect("failed to open hello.txt through mount");
+
+    // First SIGTERM — should warn about open files.
+    dibs.send_signal(libc::SIGTERM);
+
+    assert!(
+        dibs.wait_for_stderr("mount is busy", Duration::from_secs(3)),
+        "missing 'mount is busy' warning:\n{}",
+        dibs.stderr_snapshot().join("\n"),
+    );
+    assert!(dibs.is_running(), "dibs should still be running after first SIGTERM");
+
+    // Second SIGTERM — should force unmount.
+    dibs.send_signal(libc::SIGTERM);
+
+    let status = dibs
+        .wait_with_timeout(Duration::from_secs(3))
+        .expect("dibs did not exit after second SIGTERM");
+    assert!(status.success(), "expected exit 0, got {:?}", status);
+    assert!(
+        dibs.stderr_contains("force unmounting"),
+        "missing 'force unmounting' message:\n{}",
+        dibs.stderr_snapshot().join("\n"),
+    );
 }

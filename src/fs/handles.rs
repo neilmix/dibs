@@ -3,6 +3,13 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Snapshot of an open file handle for display purposes.
+pub struct OpenFileInfo {
+    pub path: PathBuf,
+    pub sid: u32,
+    pub flags: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct HandleState {
     /// The file handle ID assigned by dibs.
@@ -59,6 +66,36 @@ impl HandleTable {
 
     pub fn remove(&self, fh: u64) -> Option<HandleState> {
         self.handles.remove(&fh).map(|(_, v)| v)
+    }
+
+    /// Returns the number of open file handles.
+    pub fn count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Returns a snapshot of open file handles, excluding virtual handles
+    /// (those with real_fd < 0 or paths starting with `.dibs`).
+    ///
+    /// Note: this only sees FUSE-level handles, not kernel VFS references
+    /// (e.g. a process with CWD inside the mount). Use `try_unmount` to
+    /// probe for all mount busyness.
+    pub fn list_open(&self) -> Vec<OpenFileInfo> {
+        self.handles
+            .iter()
+            .filter(|entry| {
+                let h = entry.value();
+                h.real_fd >= 0
+                    && !h.path.starts_with(".dibs")
+            })
+            .map(|entry| {
+                let h = entry.value();
+                OpenFileInfo {
+                    path: h.path.clone(),
+                    sid: h.sid,
+                    flags: h.flags,
+                }
+            })
+            .collect()
     }
 }
 
